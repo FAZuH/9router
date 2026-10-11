@@ -239,12 +239,13 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
   // Try with available accounts (fallback on errors)
   const excludeConnectionIds = new Set();
+  const excludeProxyPoolIds = new Set();
   let lastError = null;
   let lastStatus = null;
   let lastHeaders = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model });
+    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { requestedModel: requestedModel || model, excludeProxyPoolIds });
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
@@ -316,7 +317,7 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         });
       },
       onRequestSuccess: async () => {
-        await clearAccountError(credentials.connectionId, credentials, model);
+        await clearAccountError(credentials.connectionId, credentials, model, provider);
         // "Consecutive" strikes: a success clears the breaker for this pair.
         clearAntigravityStrikes(credentials.connectionId, model);
       }
@@ -337,13 +338,19 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.
     // Do not persist a modelLock_* for this path.
+    // No-auth providers have no account to lock; the rate-limited proxy pool
+    // is excluded instead so the next attempt rotates to another pool.
+    const proxyPoolId = credentials.connectionId === "noauth"
+      ? credentials.providerSpecificData?.connectionProxyPoolId
+      : null;
     const shouldFallback = provider === "antigravity" && quotaResetMs
       ? true
-      : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs)).shouldFallback;
+      : (await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, resetsAtMs, proxyPoolId)).shouldFallback;
 
     if (shouldFallback) {
       log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} UNAVAILABLE (${result.status}) → NEXT ACCOUNT`);
       excludeConnectionIds.add(credentials.connectionId);
+      if (proxyPoolId) excludeProxyPoolIds.add(proxyPoolId);
       lastError = result.error;
       lastStatus = result.status;
       lastHeaders = upstreamResponseHeaders(result.response?.headers);
