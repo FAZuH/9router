@@ -1,4 +1,5 @@
 import { createErrorResult, parseUpstreamError, formatProviderError } from "../utils/error.js";
+import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { HTTP_STATUS, FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import { PROVIDER_MEDIA } from "../providers/index.js";
 import { getModelUpstreamId } from "../config/providerModels.js";
@@ -62,18 +63,29 @@ export async function handleSystemoneCore({
   // Cloudflare validates the body model as a short selector (e.g. "clef-flash"), not the full id.
   const requestBody = { ...body, model: getModelUpstreamId(provider, model) || model };
 
+  // Same proxy contract as chatCore: route through the proxy picked for this
+  // credential (no-auth lanes carry the selected pool on every attempt).
+  const proxyOptions = {
+    connectionProxyEnabled: credentials?.providerSpecificData?.connectionProxyEnabled === true,
+    connectionProxyUrl: credentials?.providerSpecificData?.connectionProxyUrl || "",
+    connectionNoProxy: credentials?.providerSpecificData?.connectionNoProxy || "",
+    vercelRelayUrl: credentials?.providerSpecificData?.vercelRelayUrl || "",
+    proxyPoolId: credentials?.providerSpecificData?.connectionProxyPoolId || null,
+    strictProxy: credentials?.providerSpecificData?.strictProxy === true,
+  };
+
   log?.debug?.("SYSTEMONE", `${provider.toUpperCase()} | ${model}`);
 
   let providerResponse;
   try {
-    providerResponse = await fetch(targetUrl, {
+    providerResponse = await proxyAwareFetch(targetUrl, {
       method: "POST",
       headers,
       body: JSON.stringify(requestBody),
       ...(typeof AbortSignal?.timeout === "function"
         ? { signal: AbortSignal.timeout(FETCH_CONNECT_TIMEOUT_MS) }
         : {}),
-    });
+    }, proxyOptions);
   } catch (error) {
     const errMsg = formatProviderError(error, provider, model, HTTP_STATUS.BAD_GATEWAY);
     log?.debug?.("SYSTEMONE", `Fetch error: ${errMsg}`);

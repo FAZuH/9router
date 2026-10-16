@@ -88,11 +88,12 @@ export async function handleSystemone(request) {
 
   // Credential + fallback loop (mirrors handleEmbeddings)
   const excludeConnectionIds = new Set();
+  const excludeProxyPoolIds = new Set();
   let lastError = null;
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, { excludeProxyPoolIds });
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {
@@ -120,7 +121,7 @@ export async function handleSystemone(request) {
       credentials: refreshedCredentials,
       log,
       onRequestSuccess: async () => {
-        await clearAccountError(credentials.connectionId, credentials, model);
+        await clearAccountError(credentials.connectionId, credentials, model, provider);
       }
     });
 
@@ -142,11 +143,17 @@ export async function handleSystemone(request) {
       return result.response;
     }
 
-    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model);
+    // No-auth providers have no account to lock; the rate-limited proxy pool is
+    // excluded instead so the next attempt rotates to another pool.
+    const proxyPoolId = credentials.connectionId === "noauth"
+      ? credentials.providerSpecificData?.connectionProxyPoolId
+      : null;
+    const { shouldFallback } = await markAccountUnavailable(credentials.connectionId, result.status, result.error, provider, model, null, proxyPoolId);
 
     if (shouldFallback) {
       log.warn("AUTH", `Account ${credentials.connectionName} unavailable (${result.status}), trying fallback`);
       excludeConnectionIds.add(credentials.connectionId);
+      if (proxyPoolId) excludeProxyPoolIds.add(proxyPoolId);
       lastError = result.error;
       lastStatus = result.status;
       continue;
