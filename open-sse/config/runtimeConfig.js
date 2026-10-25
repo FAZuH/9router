@@ -65,6 +65,13 @@ export const EGRESS_CONFIG = {
   ),
 };
 
+export const OPENCODE_TRANSPORT_CONFIG = {
+  mode: envChoice("OPENCODE_TRANSPORT", ["off", "auto"], "auto"),
+  bunBin: envUrl("OPENCODE_BUN_BIN", "bun"),
+  readyTimeoutMs: envMs("OPENCODE_TRANSPORT_READY_TIMEOUT_MS", 8000),
+  failureBackoffMs: envMs("OPENCODE_TRANSPORT_BACKOFF_MS", 5 * 60 * 1000),
+};
+
 // SearXNG endpoint used by the unauthenticated web-search provider.
 // Configure this for a separate Docker service or remote SearXNG instance.
 export const SEARXNG_URL = envUrl("SEARXNG_URL", "http://localhost:8888/search");

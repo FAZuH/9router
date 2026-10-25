@@ -7,6 +7,8 @@ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools, applyFingerprintSystemPrompt } from "../utils/opencodeFingerprint.js";
+import { fetchViaTransport } from "../utils/opencodeTransport.js";
+import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import {
   resolveEgress,
   markEgressCooling,
@@ -494,7 +496,7 @@ export class OpenCodeExecutor extends BaseExecutor {
     if (cooling) {
       log?.warn?.(
         "EGRESS",
-        `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429)`
+        `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429, retry-after ${result.response.headers?.get?.("retry-after") ?? "none"})`
       );
     }
 
@@ -526,6 +528,12 @@ export class OpenCodeExecutor extends BaseExecutor {
       markEgressCooling(retryEgress, parseRetryAfterMs(retryResult.response.headers, retryText));
     }
     return retryResult;
+  }
+
+  async fetchUpstream(url, options, proxyOptions = null) {
+    const response = await fetchViaTransport(url, options, proxyOptions);
+    if (response) return response;
+    return proxyAwareFetch(url, options, proxyOptions);
   }
 
   // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now

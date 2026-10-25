@@ -26,6 +26,23 @@ function responsesBody(overrides = {}) {
 }
 
 describe("applyFingerprintSystemPrompt", () => {
+  it("declares the workspace root next to the working directory", () => {
+    expect(OPENCODE_ENV_MARKER).toContain(WORKDIR_LINE);
+    expect(OPENCODE_ENV_MARKER).toContain("Workspace root folder:");
+  });
+
+  it("upgrades an older block that only declared the working directory", () => {
+    const body = chatBody({
+      messages: [
+        { role: "system", content: "Custom prompt\n\n<env>\n  Working directory: /workspace\n</env>" },
+        { role: "user", content: "hi" },
+      ],
+    });
+    applyFingerprintSystemPrompt(body);
+    expect(envCount(body.messages[0].content)).toBe(1);
+    expect(body.messages[0].content).toContain("Workspace root folder:");
+  });
+
   it("adds a system message carrying the env block when the chat body has none", () => {
     const body = chatBody();
     applyFingerprintSystemPrompt(body);

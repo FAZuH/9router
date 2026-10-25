@@ -268,17 +268,33 @@ export function takeRenamedToolNames(body) {
   return renamedToolNames.get(body) || null;
 }
 
-export const OPENCODE_ENV_MARKER = "<env>\n  Working directory: /workspace\n</env>";
+export const OPENCODE_ENV_MARKER =
+  "<env>\n  Working directory: /workspace\n  Workspace root folder: /workspace\n</env>";
 
-const ENV_MARKER_RE = /<env>[\s\S]*?Working directory:[\s\S]*?<\/env>/;
+const ENV_BLOCK_RE = /<env>([\s\S]*?)<\/env>/;
+const ENV_MARKER_RE = /<env>[\s\S]*?Working directory:[\s\S]*?Workspace root folder:[\s\S]*?<\/env>/;
+const ENV_WORKDIR_RE = /Working directory:[^\n]*/;
+const ENV_ROOT_RE = /Workspace root folder:/;
 
 function hasEnvMarker(value) {
   return typeof value === "string" && ENV_MARKER_RE.test(value);
 }
 
+function upgradeEnvBlock(text) {
+  return text.replace(ENV_BLOCK_RE, (block, inner) => {
+    if (ENV_ROOT_RE.test(inner)) return block;
+    const root = "  Workspace root folder: /workspace";
+    const upgraded = ENV_WORKDIR_RE.test(inner)
+      ? inner.replace(ENV_WORKDIR_RE, (line) => `${line}\n${root}`)
+      : `${inner.replace(/\s*$/, "")}\n${root}\n`;
+    return `<env>${upgraded}</env>`;
+  });
+}
+
 function withEnvMarker(value) {
   const text = typeof value === "string" ? value : "";
   if (hasEnvMarker(text)) return text;
+  if (ENV_BLOCK_RE.test(text)) return upgradeEnvBlock(text);
   return text.trim() ? `${text}\n\n${OPENCODE_ENV_MARKER}` : OPENCODE_ENV_MARKER;
 }
 
