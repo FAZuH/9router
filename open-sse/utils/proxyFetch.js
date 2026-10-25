@@ -1,6 +1,7 @@
 import { Readable } from "stream";
 import { MEMORY_CONFIG } from "../config/runtimeConfig.js";
 import { dbg } from "./debugLog.js";
+import { normalizeString, normalizeProxyUrl, resolveEffectiveProxyUrl } from "./proxyResolution.js";
 
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
@@ -126,11 +127,6 @@ const HTTPS_PORT = 443;
 const HTTP_SUCCESS_MIN = 200;
 const HTTP_SUCCESS_MAX = 300;
 
-function normalizeString(value) {
-  if (value === undefined || value === null) return "";
-  return String(value).trim();
-}
-
 /**
  * Resolve real IP using Google DNS (bypass system DNS)
  */
@@ -161,70 +157,6 @@ function shouldBypassMitmDns(url) {
     const hostname = new URL(url).hostname;
     return MITM_BYPASS_HOSTS.some(host => hostname.includes(host));
   } catch { return false; }
-}
-
-function shouldBypassByNoProxy(targetUrl, noProxyValue) {
-  const noProxy = normalizeString(noProxyValue);
-  if (!noProxy) return false;
-
-  let hostname;
-  try { hostname = new URL(targetUrl).hostname.toLowerCase(); } catch { return false; }
-  const patterns = noProxy.split(",").map((p) => p.trim().toLowerCase()).filter(Boolean);
-
-  return patterns.some((pattern) => {
-    if (pattern === "*") return true;
-    if (pattern.startsWith(".")) return hostname.endsWith(pattern) || hostname === pattern.slice(1);
-    return hostname === pattern || hostname.endsWith(`.${pattern}`);
-  });
-}
-
-/**
- * Get proxy URL from environment
- */
-function getEnvProxyUrl(targetUrl) {
-  const noProxy = process.env.NO_PROXY || process.env.no_proxy;
-  if (shouldBypassByNoProxy(targetUrl, noProxy)) return null;
-
-  let protocol;
-  try { protocol = new URL(targetUrl).protocol; } catch { return null; }
-
-  if (protocol === "https:") {
-    return process.env.HTTPS_PROXY || process.env.https_proxy ||
-      process.env.ALL_PROXY || process.env.all_proxy;
-  }
-
-  return process.env.HTTP_PROXY || process.env.http_proxy ||
-    process.env.ALL_PROXY || process.env.all_proxy;
-}
-
-/**
- * Normalize proxy URL (allow host:port)
- */
-function normalizeProxyUrl(proxyUrl) {
-  const normalizedInput = normalizeString(proxyUrl);
-  if (!normalizedInput) return null;
-
-  try {
-
-    new URL(normalizedInput);
-    return normalizedInput;
-  } catch {
-    // Allow "127.0.0.1:7890" style values
-    return `http://${normalizedInput}`;
-  }
-}
-
-function resolveConnectionProxyUrl(targetUrl, proxyOptions) {
-  const enabled = proxyOptions?.enabled === true || proxyOptions?.connectionProxyEnabled === true;
-  if (!enabled) return null;
-
-  const proxyUrlRaw = normalizeString(proxyOptions?.url ?? proxyOptions?.connectionProxyUrl);
-  if (!proxyUrlRaw) return null;
-
-  const noProxy = normalizeString(proxyOptions?.noProxy ?? proxyOptions?.connectionNoProxy);
-  if (noProxy && shouldBypassByNoProxy(targetUrl, noProxy)) return null;
-
-  return normalizeProxyUrl(proxyUrlRaw);
 }
 
 /**
@@ -350,9 +282,7 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
     return originalFetch(vercelRelayUrl, { ...options, headers: relayHeaders });
   }
 
-  const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
-  const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
-  const proxyUrl = connectionProxyUrl || envProxyUrl;
+  const { url: proxyUrl } = resolveEffectiveProxyUrl(targetUrl, proxyOptions);
 
   // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof
   if (shouldBypassMitmDns(targetUrl)) {

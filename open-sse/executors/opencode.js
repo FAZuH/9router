@@ -7,6 +7,18 @@ import { injectReasoningContent } from "../utils/reasoningContentInjector.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
 import { isMuseSparkModel } from "../providers/models/helpers.js";
 import { applyFingerprintTools, applyFingerprintSystemPrompt } from "../utils/opencodeFingerprint.js";
+import {
+  resolveEgress,
+  markEgressCooling,
+  getEgressCooldown,
+  hasActiveDirectCooldown,
+  hasAlternateEgresses,
+  selectAlternateProxy,
+  parseRetryAfterMs,
+  syntheticRateLimitResponse,
+  describeEgress,
+  DIRECT_EGRESS_ID,
+} from "../utils/egress.js";
 import { ANTHROPIC_API_VERSION } from "../providers/shared.js";
 import {
   normalizeResponsesInput,
@@ -70,13 +82,13 @@ export function generateSessionId(timestamp = Date.now()) {
   return `ses_${descendingTimeHex(timestamp, counter)}${unstableRandom()}`;
 }
 
-export function translateSessionId(sessionId, clientTool = "") {
+export function translateSessionId(sessionId, clientTool = "", egressId = "") {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
   const digest = crypto
     .createHash("sha256")
-    .update(`opencode\0${clientTool || "generic"}\0${sessionId || ""}`)
+    .update(`opencode\0${clientTool || "generic"}\0${egressId || "-"}\0${sessionId || ""}`)
     .digest();
   // Deterministic time field from the digest, counter pinned to 1 (what the CLI sends).
   const time = BigInt(`0x${digest.subarray(0, 5).toString("hex")}`) & SESSION_TIME_MASK;
@@ -136,8 +148,8 @@ function identityKey(credentials) {
   return "opencode:default";
 }
 
-export function stableSessionId(credentials) {
-  const key = identityKey(credentials);
+export function stableSessionId(credentials, egressId = "") {
+  const key = `${identityKey(credentials)}\0${egressId || DIRECT_EGRESS_ID}`;
   const existing = stableOpencodeSessions.get(key);
   if (existing) {
     existing.lastUsed = Date.now();
@@ -199,7 +211,7 @@ function isMessagesModel(model) {
   return MESSAGES_MODELS.has(baseModelId(model));
 }
 
-function resolveOpencodeSession(body, credentials, providerSessionId, clientTool) {
+function resolveOpencodeSession(body, credentials, providerSessionId, clientTool, egressId = "") {
   const headers = credentials?.rawHeaders || {};
   const native = nativeSession(headers);
   if (native) return native;
@@ -213,7 +225,7 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   }
 
   const hinted = incoming || normalizeSession(providerSessionId);
-  if (hinted) return translateSessionId(hinted, clientTool);
+  if (hinted) return translateSessionId(hinted, clientTool, egressId);
 
   if (credentials?.connectionId || bodyHasSessionHints(body)) {
     let viaManager = null;
@@ -227,10 +239,10 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
     } catch {
       viaManager = null;
     }
-    if (viaManager) return translateSessionId(viaManager, clientTool);
+    if (viaManager) return translateSessionId(viaManager, clientTool, egressId);
   }
 
-  return stableSessionId(credentials);
+  return stableSessionId(credentials, egressId);
 }
 
 function normalizeResponsesTools(body) {
@@ -329,14 +341,34 @@ function dropAdaptiveReasoningEffort(body) {
   if (body?.reasoning_effort === "auto") delete body.reasoning_effort;
 }
 
+function cloneRequestBody(body) {
+  if (body === null || typeof body !== "object") return body;
+  if (typeof structuredClone === "function") {
+    try { return structuredClone(body); } catch { }
+  }
+  try {
+    return JSON.parse(JSON.stringify(body));
+  } catch {
+    return body;
+  }
+}
+
+async function readResponseText(response) {
+  try {
+    return await response.clone().text();
+  } catch {
+    return "";
+  }
+}
+
 export class OpenCodeExecutor extends BaseExecutor {
   constructor() {
     super("opencode", PROVIDERS.opencode);
   }
 
-  prepareRequestCredentials({ body, credentials, providerSessionId, clientTool } = {}) {
+  prepareRequestCredentials({ body, credentials, providerSessionId, clientTool, egressId } = {}) {
     const sourceCredentials = credentials || {};
-    const session = resolveOpencodeSession(body, sourceCredentials, providerSessionId, clientTool);
+    const session = resolveOpencodeSession(body, sourceCredentials, providerSessionId, clientTool, egressId);
 
     return {
       ...sourceCredentials,
@@ -386,7 +418,114 @@ export class OpenCodeExecutor extends BaseExecutor {
   }
 
   async execute(args) {
-    return super.execute({ ...args, credentials: this.prepareRequestCredentials(args) });
+    const { model, stream, credentials, log } = args;
+    let proxyOptions = args.proxyOptions || null;
+
+    let targetUrl;
+    try {
+      targetUrl = this.buildUrl(model, stream, 0, credentials);
+    } catch {
+      targetUrl = this.config.baseUrl;
+    }
+
+    let egress;
+    try {
+      egress = await resolveEgress({
+        targetUrl,
+        proxyOptions,
+        forceProbe: hasActiveDirectCooldown(),
+      });
+    } catch (error) {
+      log?.debug?.("EGRESS", `resolve failed, failing open: ${error.message}`);
+      egress = {
+        id: DIRECT_EGRESS_ID,
+        kind: "direct",
+        confirmed: false,
+        ip: null,
+        proxyUrl: null,
+        relayUrl: null,
+      };
+    }
+
+    const cooldown = getEgressCooldown(egress);
+    if (cooldown && egress.confirmed) {
+      const selection = selectAlternateProxy(proxyOptions, targetUrl, new Set([egress.id]));
+      if (selection.alternate) {
+        log?.debug?.(
+          "EGRESS",
+          `${describeEgress(egress)} cooling ${Math.ceil(cooldown.retryAfterMs / 1000)}s → ${describeEgress(selection.alternate.egress)}`
+        );
+        proxyOptions = selection.alternate.proxyOptions;
+        egress = selection.alternate.egress;
+      } else {
+        const retryAfterMs = Math.min(cooldown.retryAfterMs, selection.earliestCooldownMs ?? Infinity);
+        log?.warn?.(
+          "EGRESS",
+          `${describeEgress(egress)} cooling ${Math.ceil(cooldown.retryAfterMs / 1000)}s; no alternate — local 429`
+        );
+        return {
+          response: syntheticRateLimitResponse(retryAfterMs),
+          url: targetUrl,
+          headers: {},
+          transformedBody: args.body,
+        };
+      }
+    }
+
+    const prepared = this.prepareRequestCredentials({ ...args, egressId: egress.id });
+    const retryBody = hasAlternateEgresses(proxyOptions) ? cloneRequestBody(args.body) : null;
+
+    const result = await super.execute({ ...args, credentials: prepared, proxyOptions });
+    if (!result?.response || result.response.status !== 429) return result;
+
+    const bodyText = await readResponseText(result.response);
+    const retryAfterMs = parseRetryAfterMs(result.response.headers, bodyText);
+
+    if (egress.kind === "direct" && !egress.confirmed) {
+      try {
+        const probed = await resolveEgress({ targetUrl, proxyOptions, forceProbe: true, fresh: true });
+        if (probed.confirmed) egress = probed;
+      } catch (error) {
+        log?.debug?.("EGRESS", `direct probe failed, fail-open: ${error.message}`);
+      }
+    }
+
+    const cooling = markEgressCooling(egress, retryAfterMs);
+    if (cooling) {
+      log?.warn?.(
+        "EGRESS",
+        `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429)`
+      );
+    }
+
+    const selection = selectAlternateProxy(proxyOptions, targetUrl, new Set([egress.id]));
+    if (!selection.alternate) return result;
+
+    const retryEgress = selection.alternate.egress;
+    const retryProxyOptions = selection.alternate.proxyOptions;
+    const retryCredentials = this.prepareRequestCredentials({
+      ...args,
+      body: retryBody || args.body,
+      egressId: retryEgress.id,
+    });
+
+    log?.warn?.(
+      "EGRESS",
+      `429 on ${describeEgress(egress)} → retry once on ${describeEgress(retryEgress)}`
+    );
+
+    const retryResult = await super.execute({
+      ...args,
+      body: retryBody || args.body,
+      credentials: retryCredentials,
+      proxyOptions: retryProxyOptions,
+    });
+
+    if (retryResult?.response?.status === 429) {
+      const retryText = await readResponseText(retryResult.response);
+      markEgressCooling(retryEgress, parseRetryAfterMs(retryResult.response.headers, retryText));
+    }
+    return retryResult;
   }
 
   // Free tier moved from /zen/v1 to /inference/v1 (OpenCode v2); /zen/v1 now
