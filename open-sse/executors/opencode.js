@@ -84,13 +84,13 @@ export function generateSessionId(timestamp = Date.now()) {
   return `ses_${descendingTimeHex(timestamp, counter)}${unstableRandom()}`;
 }
 
-export function translateSessionId(sessionId, clientTool = "", egressId = "") {
+export function translateSessionId(sessionId, clientTool = "", egressId = "", epoch = 0) {
   if (typeof sessionId === "string" && OPENCODE_SESSION_RE.test(sessionId.trim())) {
     return sessionId.trim();
   }
   const digest = crypto
     .createHash("sha256")
-    .update(`opencode\0${clientTool || "generic"}\0${egressId || "-"}\0${sessionId || ""}`)
+    .update(`opencode\0${clientTool || "generic"}\0${egressId || "-"}\0${epoch}\0${sessionId || ""}`)
     .digest();
   // Deterministic time field from the digest, counter pinned to 1 (what the CLI sends).
   const time = BigInt(`0x${digest.subarray(0, 5).toString("hex")}`) & SESSION_TIME_MASK;
@@ -127,12 +127,18 @@ function nativeSession(headers) {
 // that: one stable canonical session per downstream identity, evicted
 // after MEMORY_CONFIG.sessionTtlMs like the other session stores.
 const stableOpencodeSessions = new Map();
+const opencodeSessionEpochs = new Map();
 const MAX_STABLE_SESSIONS = 1000;
 const stableSessionCleanup = setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of stableOpencodeSessions) {
     if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) {
       stableOpencodeSessions.delete(key);
+    }
+  }
+  for (const [key, entry] of opencodeSessionEpochs) {
+    if (now - entry.lastUsed > MEMORY_CONFIG.sessionTtlMs) {
+      opencodeSessionEpochs.delete(key);
     }
   }
 }, MEMORY_CONFIG.sessionCleanupIntervalMs);
@@ -150,8 +156,28 @@ function identityKey(credentials) {
   return "opencode:default";
 }
 
+function sessionScopeKey(credentials, egressId) {
+  return `${identityKey(credentials)}\0${egressId || DIRECT_EGRESS_ID}`;
+}
+
+function sessionEpoch(credentials, egressId) {
+  return opencodeSessionEpochs.get(sessionScopeKey(credentials, egressId))?.epoch || 0;
+}
+
+function rotateSession(credentials, egressId) {
+  if (nativeSession(credentials?.rawHeaders)) return false;
+  const key = sessionScopeKey(credentials, egressId);
+  const current = opencodeSessionEpochs.get(key);
+  if (opencodeSessionEpochs.size >= MAX_STABLE_SESSIONS && !current) {
+    opencodeSessionEpochs.delete(opencodeSessionEpochs.keys().next().value);
+  }
+  opencodeSessionEpochs.set(key, { epoch: (current?.epoch || 0) + 1, lastUsed: Date.now() });
+  stableOpencodeSessions.delete(key);
+  return true;
+}
+
 export function stableSessionId(credentials, egressId = "") {
-  const key = `${identityKey(credentials)}\0${egressId || DIRECT_EGRESS_ID}`;
+  const key = sessionScopeKey(credentials, egressId);
   const existing = stableOpencodeSessions.get(key);
   if (existing) {
     existing.lastUsed = Date.now();
@@ -227,7 +253,7 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
   }
 
   const hinted = incoming || normalizeSession(providerSessionId);
-  if (hinted) return translateSessionId(hinted, clientTool, egressId);
+  if (hinted) return translateSessionId(hinted, clientTool, egressId, sessionEpoch(credentials, egressId));
 
   if (credentials?.connectionId || bodyHasSessionHints(body)) {
     let viaManager = null;
@@ -241,7 +267,7 @@ function resolveOpencodeSession(body, credentials, providerSessionId, clientTool
     } catch {
       viaManager = null;
     }
-    if (viaManager) return translateSessionId(viaManager, clientTool, egressId);
+    if (viaManager) return translateSessionId(viaManager, clientTool, egressId, sessionEpoch(credentials, egressId));
   }
 
   return stableSessionId(credentials, egressId);
@@ -477,11 +503,13 @@ export class OpenCodeExecutor extends BaseExecutor {
     const prepared = this.prepareRequestCredentials({ ...args, egressId: egress.id });
     const retryBody = hasAlternateEgresses(proxyOptions) ? cloneRequestBody(args.body) : null;
 
-    const result = await super.execute({ ...args, credentials: prepared, proxyOptions });
+    let result = await super.execute({ ...args, credentials: prepared, proxyOptions });
+
     if (!result?.response || result.response.status !== 429) return result;
 
     const bodyText = await readResponseText(result.response);
     const retryAfterMs = parseRetryAfterMs(result.response.headers, bodyText);
+    const rotated = rotateSession(prepared, egress.id);
 
     if (egress.kind === "direct" && !egress.confirmed) {
       try {
@@ -492,19 +520,32 @@ export class OpenCodeExecutor extends BaseExecutor {
       }
     }
 
-    const cooling = markEgressCooling(egress, retryAfterMs);
-    if (cooling) {
-      log?.warn?.(
-        "EGRESS",
-        `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429, retry-after ${result.response.headers?.get?.("retry-after") ?? "none"})`
-      );
+    const selection = selectAlternateProxy(proxyOptions, targetUrl, new Set([egress.id]));
+    const retrySameEgress = rotated && egress.kind === "direct";
+
+    if (!selection.alternate && !retrySameEgress) {
+      const cooling = markEgressCooling(egress, retryAfterMs);
+      if (cooling) {
+        log?.warn?.(
+          "EGRESS",
+          `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429, retry-after ${result.response.headers?.get?.("retry-after") ?? "none"})`
+        );
+      }
+      return result;
     }
 
-    const selection = selectAlternateProxy(proxyOptions, targetUrl, new Set([egress.id]));
-    if (!selection.alternate) return result;
+    if (selection.alternate) {
+      const cooling = markEgressCooling(egress, retryAfterMs);
+      if (cooling) {
+        log?.warn?.(
+          "EGRESS",
+          `${describeEgress(egress)} cooling ${Math.ceil(cooling.retryAfterMs / 1000)}s (429, retry-after ${result.response.headers?.get?.("retry-after") ?? "none"})`
+        );
+      }
+    }
 
-    const retryEgress = selection.alternate.egress;
-    const retryProxyOptions = selection.alternate.proxyOptions;
+    const retryEgress = selection.alternate?.egress || egress;
+    const retryProxyOptions = selection.alternate?.proxyOptions ?? proxyOptions;
     const retryCredentials = this.prepareRequestCredentials({
       ...args,
       body: retryBody || args.body,
