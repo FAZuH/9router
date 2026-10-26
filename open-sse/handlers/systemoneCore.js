@@ -92,12 +92,18 @@ export async function handleSystemoneCore({
     proxyPoolId: credentials?.providerSpecificData?.connectionProxyPoolId || null,
     strictProxy: credentials?.providerSpecificData?.strictProxy === true,
   };
+  // proxyAwareFetch captured the pristine fetch at module load, so it never
+  // sees a later global stub (tests) — call the current global directly when
+  // no proxy is configured; the proxy path keeps the undici dispatcher logic.
+  const useProxy = proxyOptions.connectionProxyEnabled || proxyOptions.connectionProxyUrl ||
+    proxyOptions.vercelRelayUrl || proxyOptions.proxyPoolId;
+  const doFetch = useProxy ? proxyAwareFetch : globalThis.fetch;
 
   log?.debug?.("SYSTEMONE", `${provider.toUpperCase()} | ${model}`);
 
   let providerResponse;
   try {
-    providerResponse = await proxyAwareFetch(targetUrl, {
+    providerResponse = await doFetch(targetUrl, {
       method: "POST",
       headers,
       body: JSON.stringify(requestBody),
