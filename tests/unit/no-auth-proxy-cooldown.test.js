@@ -12,6 +12,19 @@ const dbMocks = vi.hoisted(() => ({
 const proxyMocks = vi.hoisted(() => ({
   pickProxyPoolId: vi.fn(),
   resolveConnectionProxyConfig: vi.fn(),
+  // faithful shim of the real proxyConfigFromPool: alternates only from
+  // active pools with a proxyUrl, everything else filtered out downstream
+  proxyConfigFromPool: vi.fn((pool) => {
+    if (!pool || pool.isActive !== true || !String(pool.proxyUrl || "").trim()) return null;
+    return {
+      proxyPoolId: pool.id,
+      connectionProxyEnabled: true,
+      connectionProxyUrl: pool.proxyUrl,
+      connectionNoProxy: "",
+      vercelRelayUrl: "",
+      strictProxy: false,
+    };
+  }),
 }));
 
 vi.mock("@/lib/localDb", () => dbMocks);

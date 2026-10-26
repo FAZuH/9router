@@ -133,7 +133,9 @@ describe("no-auth credential shape isolation", () => {
   it("keeps other free providers free of opencode proxy alternates", async () => {
     const credentials = await getProviderCredentials("mimo-free");
 
-    expect(mocks.getProxyPools).not.toHaveBeenCalled();
+    // fork behavior: a fixed pool is loaded to run the cooldown/exclusion
+    // check even when rotateStrategy is none; alternates stay opencode-only
+    expect(mocks.getProxyPools).toHaveBeenCalledOnce();
     expect(credentials.providerSpecificData).not.toHaveProperty("connectionProxyAlternates");
     expect(credentials.providerSpecificData.connectionProxyPoolId).toBe("pool-b");
   });
