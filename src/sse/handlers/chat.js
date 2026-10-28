@@ -360,6 +360,12 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
 
     if (result.success) return result.response;
 
+    // Our own cooldown gate answered (every egress is cooling and there was no
+    // alternate to rotate to). Attributing that reply back to the selected pool
+    // would escalate its backoff from a message the pool never sent, so hand the
+    // 429 straight back instead of running the fallback bookkeeping.
+    if (result.response?.headers?.get?.("x-9router-synthetic")) return result.response;
+
     // Antigravity 409/429: refresh live quota to get exact resetAt before locking
     let quotaResetMs = null;
     let resetsAtMs = result.resetsAtMs;

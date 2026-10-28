@@ -160,6 +160,8 @@ describe("OpenCode free-lane egress switching", () => {
     expect(result.response.status).toBe(429);
     expect(Number(result.response.headers.get("retry-after"))).toBeGreaterThan(40);
     expect(Number(result.response.headers.get("retry-after"))).toBeLessThanOrEqual(45);
+    // Tagged so the handler never books our own cooldown reply against a pool.
+    expect(result.response.headers.get("x-9router-synthetic")).toBe("egress-cooldown");
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

@@ -476,6 +476,9 @@ export function syntheticRateLimitResponse(retryAfterMs) {
     headers: {
       "content-type": "application/json",
       "retry-after": String(retryAfterSec),
+      // Tells the handler this reply came from our own cooldown gate, not from
+      // upstream, so it must not be attributed back to the proxy pool's backoff.
+      "x-9router-synthetic": "egress-cooldown",
     },
   });
 }
