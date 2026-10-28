@@ -97,11 +97,13 @@ export class BaseExecutor {
     return { status: response.status, message: bodyText || `HTTP ${response.status}` };
   }
 
+  // Transport hook: subclasses with their own wire client (opencode's Bun
+  // sidecar) override this instead of threading a fetcher through execute.
   fetchUpstream(url, options, proxyOptions = null) {
     return proxyAwareFetch(url, options, proxyOptions);
   }
 
-  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, providerOverrides = null }) {
+  async execute({ model, body, stream, credentials, signal, log, proxyOptions = null, providerOverrides = null, directFetch = null }) {
     const fallbackCount = this.getFallbackCount();
     let lastError = null;
     let lastStatus = 0;
@@ -151,7 +153,10 @@ export class BaseExecutor {
           method: "POST",
           headers,
           body: bodyStr,
-          signal: mergedSignal
+          signal: mergedSignal,
+          // Protocol adapters that need their own transport (opencode's TLS
+          // fingerprint) override the direct path; proxies still take priority.
+          ...(directFetch ? { directFetch } : {}),
         }, proxyOptions);
         clearTimeout(connectTimer);
         const ct = response.headers?.get?.("content-type") || "";

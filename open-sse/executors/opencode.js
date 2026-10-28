@@ -460,12 +460,17 @@ export class OpenCodeExecutor extends BaseExecutor {
       applyFingerprintTools(body, true);
     } else if (body && typeof body === "object") {
       dropAdaptiveReasoningEffort(body);
-      applyFingerprintTools(body, false);
+      applyFingerprintTools(body, false, { claude: isMessagesModel(model || body?.model) });
     }
     applyFingerprintSystemPrompt(body);
     return injectReasoningContent({ provider: this.provider, model, body });
   }
 
+  // The free gate keys on the TLS ClientHello, so a native Node fetch is refused
+  // no matter how faithful the body is. fetchUpstream routes through the Bun
+  // sidecar, which sends that ClientHello and honors the proxy pool the egress
+  // picked; when the sidecar is unavailable it falls back to proxyAwareFetch and
+  // the request still goes out (subject to the gate) instead of failing here.
   async execute(args) {
     const { model, stream, credentials, log } = args;
     let proxyOptions = args.proxyOptions || null;
