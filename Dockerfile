@@ -20,7 +20,11 @@ ARG NPM_REGISTRY
 RUN apk add --no-cache python3 make g++ linux-headers
 
 COPY package.json ./
-RUN npm install \
+# Cache mount: a flaky egress kills npm mid-download (ETIMEDOUT/ECONNRESET on
+# 2026-10-27/28); the cache keeps completed packages so a retry fetches only
+# what is missing instead of restarting a ~400 MB install from zero.
+RUN --mount=type=cache,target=/root/.npm \
+    npm install \
       --registry="${NPM_REGISTRY}" \
       --fetch-retries=5 \
       --fetch-retry-factor=2 \
